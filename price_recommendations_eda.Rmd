@@ -1,0 +1,350 @@
+---
+title: "Undersøgelse af prissætning i QL"
+author: "pech@saxo.com"
+date: "`r lubridate::today()`"
+output: 
+  html_document:
+   css: style.css
+---
+
+Vi undersøger her et antal bøger prissat i QL (i alt tre prisgrupper). Vi vil gerne vide om prissætningen er den rette ved bl.a. at undersøge forhold mellem markedsposition, prissætning, conversion rate og genrer.
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = F, warning=F,message=F)
+```
+
+
+```{r}
+library(tidyverse)
+library(RODBC)
+library(readxl)
+library(broom)
+theme_set(theme_minimal())
+```
+
+
+```{r}
+df <- read_excel("Price_recommendations1.xlsx") %>% 
+  mutate(conversionrate = as.numeric(conversionrate))
+
+## query
+
+query <- "
+Select 
+	tbl1.Product_Key,
+	isbn13,
+	n,
+	category,
+	case when Series_Key is null then 0 else 1 end as inSeries
+
+from (
+	SELECT TOP 1000
+      [Product_Key]
+	  ,count(Product_Key) as n
+
+  FROM [EDW].[edw].[OrderFact] 
+  where DateOrdered_Key > 20200301
+
+  group by Product_Key
+
+  order by n desc) tbl1
+
+inner join (
+	select Product_Key, 
+		   isbn13 
+
+	from [EDW].[edw].[Product]) tbl2 on tbl2.Product_Key = tbl1.Product_Key
+
+inner join (
+	select Product_Key, 
+		   ThemaCategory_Key
+	
+	from [EDW].[edw].[ProductThemaCategoryFact]) tbl3 on tbl3.Product_Key = tbl2.Product_Key
+
+inner join (
+	select ThemaCategory_Key,
+			CustomerAura_ProductCategoryGroup as category
+			
+	from [EDW].[edw].[ThemaCategory]) tbl4 on tbl4.ThemaCategory_Key = tbl3.ThemaCategory_Key
+
+left join (
+	select Product_Key, 
+		   Series_Key
+	
+	from  [EDW].[edw].[ProductSeriesFact]) tbl5 on tbl5.Product_Key = tbl1.Product_Key
+
+	order by n desc"
+
+#####
+#####
+credentials <- read_rds("credentials.rds")
+
+channel <- odbcConnect(credentials[1],credentials[2],credentials[3])
+
+df2 <- sqlQuery(channel,query) %>% as_tibble() %>%
+  select(isbn13,inSeries,LitGroup = category) %>%
+  mutate(isbn13 = as.character(isbn13)) %>%
+  distinct()
+
+df <- df %>%
+  left_join(df2,by="isbn13")
+```
+
+### Antal bøger fordelt på QL grupper
+
+Der er en klar overvægt af bøger i kategorien "Premium pris først test".
+
+```{r}
+df %>% count(Group) %>% kableExtra::kable() %>% kableExtra::kable_styling()
+```
+
+***
+
+## Markedsposition
+
+### Markeds- og prisposition for de tre prisgrupper
+
+Grafen endenfor viser fordeling af vores pris-/markedspositioner.
+
+Bemærk at vi skal finde ud af hvad forskellen er på de to variabler. Jeg kan ikke finde dokumentation på dette fra QL.
+I det følgende bruges markedsposition.
+
+```{r}
+df %>%
+  select(Group, pricing_position = `Pricing Position`, market_position) %>%
+  mutate_at(vars(pricing_position,market_position),as.numeric) %>%
+  pivot_longer(cols = ends_with("position")) %>%
+  group_by(Group,name) %>%
+  count(value) %>%
+  #filter(name == "market_position") %>%
+  ggplot(aes(value,n)) +
+    geom_col() +
+    facet_grid(name ~Group,scales = "free")+
+   labs(x="position")
+```
+
+### Markedsposition og conversion rate niveauer
+
+Vi ser at positioneringen fordeler sig nogenenlunde ens for forskellige conversion rate niveauer (her inddelt i fem grupper).
+
+```{r}
+name_join <- df %>%
+  select(conversionrate) %>%
+  mutate(conv_rate_group = ntile(conversionrate,5)) %>%
+   group_by(conv_rate_group) %>% 
+   filter(conversionrate == min(conversionrate)) %>% 
+   distinct(conversionrate,conv_rate_group) %>%
+   ungroup() %>%
+   mutate(conv_rate_group_name = paste0(conv_rate_group,". >",conversionrate)) %>%
+  select(conv_rate_group,conv_rate_group_name)
+ 
+ df %>%
+  mutate(conversionrate = as.numeric(conversionrate)) %>%
+  mutate(conv_rate_group = ntile(conversionrate,5)) %>%
+  inner_join(name_join) %>%
+  select(conv_rate_group_name, market_position) %>%
+  mutate_at(vars(market_position),as.numeric) %>%
+  pivot_longer(cols = ends_with("position")) %>%
+  group_by(conv_rate_group_name) %>%
+  count(value) %>%
+  ggplot(aes(value,n)) +
+  geom_col() +
+  facet_wrap(~conv_rate_group_name) +
+  labs(x="markedsposition")
+```
+
+De ensartede fordelinger ses også når vi beregner på gennemsnits- og medianpositioner.
+
+```{r}
+df %>%
+    mutate(conversionrate = as.numeric(conversionrate)) %>%
+    mutate(conv_rate_group = ntile(conversionrate,5)) %>%
+    inner_join(name_join) %>%
+    select(conv_rate_group_name, market_position) %>%
+    mutate_at(vars(market_position),as.numeric) %>%
+    pivot_longer(cols = ends_with("position")) %>% 
+    group_by(conv_rate_group_name) %>% 
+    summarise(median = median(value,na.rm=T),avg=mean(value,na.rm=T)) %>% 
+    kableExtra::kable() %>% 
+    kableExtra::kable_styling()
+```
+
+***
+
+## Conversion rate
+
+### Conversion rates for de tre prisgrupper
+
+Grafen nedenfor viser conversion rates for de forskellige prisgrupper. Der ser ikke ud til at være nogen klar forskel.
+
+```{r}
+df %>%
+  select(conversionrate,Group) %>%
+  mutate(conversionrate = as.numeric(conversionrate)) %>%
+  ggplot(aes(conversionrate,fill=factor(Group))) +
+  geom_density() +
+  facet_wrap(~Group,ncol=1) +
+  ggthemes::scale_fill_tableau() +
+  theme(legend.position="none") 
+```
+
+Der er heller ikke nogen markant forskel på gennemsnit og median.
+
+```{r}
+df %>%
+  group_by(Group) %>%
+  summarise(avg = mean(conversionrate),
+            median = median(conversionrate))  %>% 
+    kableExtra::kable() %>% 
+    kableExtra::kable_styling()
+```
+
+### Conversion rates for litterær genre
+
+Da vi ikke har så mange data, bruger vi den simple opdeling i skøn- og faglitteratur. Her ser vi dog en mere markant forskel i conversion rate, så faglitteratur har en højere rate sammenlignet med skønlitteratur.
+
+```{r}
+
+df %>%
+  select(isbn13,conversionrate,LitGroup) %>%
+  distinct() %>%
+  drop_na() %>%
+  ggplot(aes(conversionrate,fill=factor(LitGroup))) +
+  geom_density() +
+  facet_wrap(~LitGroup,ncol=1)  +
+  ggthemes::scale_fill_tableau() +
+  theme(legend.position="none") 
+```
+
+### Conversion rates for bøger i serie
+
+Ifølge grafen her, har bøger der hører til en serie en *lavere* conversion rate. Datagrundlaget er dog ret beskedent med 208 bøger der ikke er i en serie, og 58 bøger der hører til en serie.
+
+```{r}
+df %>%
+  select(isbn13,conversionrate,inSeries) %>%
+  distinct() %>%
+  drop_na() %>%
+  ggplot(aes(conversionrate,fill=factor(inSeries))) +
+  geom_density() +
+  facet_wrap(~inSeries,ncol=1)  +
+  ggthemes::scale_fill_tableau() +
+  theme(legend.position="none") 
+```
+
+### En regressionsmodel for conversion rate
+
+Vi kan lave en model for at undersøge hvilke faktorer der kan forklare forskelle i conversion rate.
+I denne model indgår prisposition, markedsposition, prisgruppe, litterær gruppe og seriemedlemskab (ja/nej)
+
+I nedenstående output ser vi, at faglitteratur har en væsentligt højere conversion rate (44%).
+Vi kan også se at bøger i "Top 51-100 bøger (custom rule)"-gruppen har en 25% højere conversion rate smmenlignet med "Premium pris først test"
+
+```{r}
+df_lm <- df %>%
+  select(Group,inSeries,LitGroup,conversionrate,pricing_position = `Pricing Position`,market_position) %>%
+  mutate(Group = as.factor(Group),
+         inSeries = as.factor(inSeries),
+         LitGroup = fct_relevel(LitGroup,levels = c("Skønlitteratur", "Faglitteratur")),
+         pricing_position = as.numeric(pricing_position),
+         market_position = as.numeric(market_position),
+         conversionrate = log(as.numeric(conversionrate)))
+
+mod <- lm(conversionrate ~ .,data = df_lm)
+#summary(mod)
+
+mod %>% 
+  tidy() %>% 
+  select(term,estimate,p.value) %>% 
+  filter(term != "(Intercept)") %>%
+  mutate(estimate = (exp(estimate)-1)*100,
+         p.value = if_else(p.value < .05,"signifikant","ns")) %>% 
+    kableExtra::kable() %>% 
+    kableExtra::kable_styling()
+```
+
+***
+
+### Profit pr. prisgruppe
+
+Jeg kender ikke reglerne der ligger til grund for prissøtningen, men nedenfor ser vi hvordan profitten er fordelt på de tre prisgrupper.
+Vi ser bl.a. at medianprofitten for "Premium pris først test"-bøger er 0, men samtidigt den laveste conversion rate (jf. regressionsmodellen).
+
+```{r}
+df %>%
+  mutate(profit = `Profit (24h)`) %>%
+  group_by(Group) %>%
+  summarise(median = median(profit),
+            avg = mean(profit)) %>% 
+    kableExtra::kable() %>% 
+    kableExtra::kable_styling()
+
+df %>%
+  mutate(profit = `Profit (24h)`) %>%
+  group_by(Group) %>%
+  ggplot(aes(profit,fill=Group)) +
+  geom_density() +
+  facet_wrap(~Group,ncol=3,scales="free") +
+  xlim(c(-50,150)) +
+  ggthemes::scale_fill_tableau() +
+  theme(legend.position="none") 
+```
+
+***
+
+### Prissammenligninger for de tre prisgrupper
+
+I de følgende grafer, ser vi relationerne mellem "shelf price" og henholdsvis "recommended price" og "recommended retail price".
+
+```{r}
+p1 <- df %>%
+  select(Group,
+         shelf_price = `Shelf Price (Standard Price)`,
+         recommended_price = `Recommended Price (Standard Price)`,
+         recommended_retail_price) %>%
+  ggplot(aes(shelf_price,recommended_price,colour=Group)) +
+  geom_point(alpha = .5) +
+  ggthemes::scale_colour_tableau()
+
+p2 <- df %>%
+  select(Group,
+         shelf_price = `Shelf Price (Standard Price)`,
+         recommended_price = `Recommended Price (Standard Price)`,
+         recommended_retail_price) %>%
+    mutate(recommended_retail_price = as.numeric(recommended_retail_price)) %>%
+  ggplot(aes(shelf_price,recommended_retail_price,colour=Group)) +
+  geom_point(alpha = .5) +
+  ggthemes::scale_colour_tableau()
+
+gridExtra::grid.arrange(p1,p2)
+```
+
+***
+
+### "Recommendation reasons"
+
+Her ser vi de hyppigste grunde til prissætning for de tre grupper
+
+```{r fig.width=10}
+library(tidytext)
+reasons <- df %>% 
+  select(Group,reason = `Recommendation Reason (Standard Price)`) %>%
+  mutate(reason = str_replace_all(reason,"[[:digit:]]","x")) %>% 
+  mutate(reason = str_extract(reason, "[^,]+")) %>%
+  group_by(Group,reason) %>%
+  count(sort = T) %>%
+  ungroup() 
+
+reasons %>%
+  mutate(Group = as.factor(Group),
+           reason = reorder_within(reason, n, Group)) %>%
+  ggplot(aes(reason,n,fill=Group)) +
+  geom_col() +
+  facet_wrap(~Group,scales = "free_y",ncol=1) +
+  coord_flip() +
+     scale_x_reordered() +
+    scale_y_continuous(expand = c(0,0)) +
+  ggthemes::scale_fill_tableau()
+```
+
+***

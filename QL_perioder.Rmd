@@ -1,0 +1,422 @@
+---
+title: "QL analyse - Perioder"
+date: "`r lubridate::today()`"
+author: Peer Christensen - pech@saxo.com
+output: html_document
+
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = F, warning = F, message = F, cache =F)
+```
+
+På baggrund af en ændring i Quicklizard omkring den 23/24 april og vi vil gerne se om det har påvirket salg, omsætning, samt anskaffelsen af nye medlemmer. 
+
+Analysen her sammenligner data der knytter sig til top 50 bøger fra to tidsperioder:
+1. 6/4 t.o.m 19/4
+2. 27/4 t.o.m 10/5
+
+### Det hurtige overblik
+
+Bemærk at data her udelukkende er grupperet ift. perioder.
+<br>
+```{r}
+library(tidyverse)
+library(RODBC)
+library(readxl)
+library(gt)
+
+query <- 
+  "SELECT  [DateOrdered_Key]
+  ,Customer_Key
+	,case when DateOrdered_Key >= 20200406 and DateOrdered_Key <= 20200419 then 'Period1'
+	      when DateOrdered_Key >= 20200427 and DateOrdered_Key <= 20200510 then 'Period2'
+		  end as Period
+      ,orders.Product_Key
+      ,orders.OrderID
+	  ,products.isbn13
+	  ,products.title
+	  ,[1_GrossRevenue]
+      ,[3_NetRevenue]
+	  ,ProductSales
+      ,[4_DB1]
+      ,[5_DB2]
+      ,[SubscriptionInit_Key]
+      ,[SubscriptionPurchase_Key] -- 72515285 = ja, premium, 72515284 = ja, plus, 72515286 = nej
+  FROM [EDW].[edw].[OrderFactCombined] orders
+  inner join [EDW].[edw].[Product] products on products.Product_Key = orders.Product_Key
+
+  where ((DateOrdered_Key >= 20200406 and DateOrdered_Key <= 20200419)
+  or    (DateOrdered_Key >= 20200427 and DateOrdered_Key <= 20200510))
+  and isbn13 != 'Other'"
+
+
+credentials <- read_rds("credentials.rds")
+
+channel <- odbcConnect(credentials[1],credentials[2],credentials[3])
+
+df <- sqlQuery(channel,query) %>%
+  as_tibble() %>%
+  filter(SubscriptionInit_Key != -1)
+
+df2 <- read_excel("Top50 24-4.xlsx")
+
+isbns <- df2 %>% pull(isbn13)
+
+df <- df %>%
+  filter(isbn13 %in% isbns)
+
+# antal transaktioner
+transactions <- df %>%
+  count(Period) %>%
+  rename(transactions = n)
+
+# den samlede omsætning, DB1, DB2
+revenue <- df %>%
+  group_by(Period) %>%
+  summarise(
+    Revenue = sum(ProductSales),
+    DB1     = sum(`4_DB1`),
+    DB2     = sum(`5_DB2`)
+  )
+
+overview <- reduce(list(transactions,revenue),inner_join)
+
+overview <- overview %>%
+  select(-Period) %>%
+  rownames_to_column() %>% 
+  gather(var, value, -rowname) %>% 
+  mutate(value = round(value)) %>%
+  spread(rowname, value) %>%
+  rename(Period1 = `1`, Period2 = `2`) %>%
+  mutate(order = c(3,4,2,1)) %>%
+  arrange(order) %>%
+  select(-order)
+
+overview %>% gt() %>%
+  fmt_number(
+    columns = 2:3,
+    decimals = 0,
+    suffixing = F
+  ) %>%
+  tab_options(table.align = "left") %>%
+  tab_header("Samlede salgstal for bøgerne")
+
+```
+
+<br>
+
+```{r}
+overview2 <- reduce(list(transactions,revenue),inner_join)
+
+overview2 <- overview2 %>%
+  select(Period,transactions, Revenue, DB1,DB2) %>%
+  mutate(Revenue = Revenue / transactions,
+         DB1 = DB1 / transactions,
+         DB2 = DB2 / transactions) %>%
+  select(-Period, -transactions) %>%
+  rownames_to_column() %>% 
+  gather(var, value, -rowname) %>% 
+  spread(rowname, value) %>%
+  rename(Period1 = `1`, Period2 = `2`) %>%
+  mutate(order = c(2,3,1)) %>%
+  arrange(order) %>%
+  select(-order)
+
+overview2 %>% gt() %>%
+  fmt_number(
+    columns = 2:3,
+    decimals = 0,
+    suffixing = F
+  ) %>%
+  tab_options(table.align = "left") %>%
+  tab_header("salgstal pr. bogkøb")
+```
+
+<br>
+Hvor de ovenstående tal stammer fra salg af de relevante bøger uafhængigt af ordrestørrelsen, vises de samme tal, men på ordreniveau nedenfor. 
+<br>
+```{r}
+# ordreniveau
+df <- sqlQuery(channel,query) %>%
+  as_tibble() %>%
+  filter(SubscriptionInit_Key != -1) 
+
+df <- df %>%
+  group_by(OrderID) %>%
+  mutate(revenue = sum(ProductSales),
+         DB1 = sum(`4_DB1`),
+         DB2 = sum(`5_DB2`),
+         n_products = n()) %>%
+  ungroup()
+
+df2 <- read_excel("Top50 24-4.xlsx")
+
+isbns <- df2 %>% pull(isbn13)
+
+df <- df %>%
+  filter(isbn13 %in% isbns)
+
+# antal transaktioner
+transactions <- df %>%
+  count(Period) %>%
+  rename(transactions = n)
+
+# den samlede omsætning, DB1, DB2
+revenue <- df %>%
+  group_by(Period) %>%
+  summarise(
+    Revenue = sum(revenue),
+    DB1     = sum(DB1),
+    DB2     = sum(DB2),
+    n_products = sum(n_products))
+
+overview <- reduce(list(transactions,revenue),inner_join)
+
+overview <- overview %>%
+  select(-Period,-transactions) %>%
+  rownames_to_column() %>% 
+  gather(var, value, -rowname) %>% 
+  mutate(value = round(value)) %>%
+  spread(rowname, value) %>%
+  rename(Period1 = `1`, Period2 = `2`) %>%
+  mutate(order = c(2,3,4,1)) %>%
+  arrange(order) %>%
+  select(-order)
+
+overview %>% gt() %>%
+  fmt_number(
+    columns = 2:3,
+    decimals = 0,
+    suffixing = F
+  ) %>%
+  tab_options(table.align = "left") %>%
+  tab_header("Samlede salgstal på ordreniveau")
+```
+
+<br>
+
+```{r}
+overview2 <- reduce(list(transactions,revenue),inner_join)
+
+overview2 <- overview2 %>%
+  select(Period,transactions,n_products, Revenue, DB1,DB2) %>%
+  mutate(Revenue = Revenue / transactions,
+         DB1 = DB1 / transactions,
+         DB2 = DB2 / transactions,
+         n_products = n_products / transactions) %>%
+  select(-Period, -transactions) %>%
+  rownames_to_column() %>% 
+  gather(var, value, -rowname) %>% 
+  spread(rowname, value) %>%
+  rename(Period1 = `1`, Period2 = `2`) %>%
+  mutate(order = c(2,3,4,1)) %>%
+  arrange(order) %>%
+  select(-order)
+
+overview2 %>% gt() %>%
+  fmt_number(
+    columns = 2:3,
+    decimals = 1,
+    suffixing = F
+  ) %>%
+  tab_options(table.align = "left") %>%
+  tab_header("salgstal pr. ordre")
+```
+
+<br>
+
+```{r}
+# antal nye medlemmer
+new_members <- df %>%
+  filter(SubscriptionInit_Key == 1) %>%
+  group_by(Period) %>%
+  count() %>%
+  rename(new_members = n)
+  
+# medlemskonvertering
+conversion <- df %>%
+  group_by(Period,SubscriptionInit_Key) %>%
+  summarise(n = n()) %>%
+  pivot_wider(names_from = SubscriptionInit_Key,values_from = n) %>%
+  mutate(Premium_conv_rate = `1` / `0` * 100) %>%
+  select(Period, Premium_conv_rate) %>%
+  mutate(Premium_conv_rate = round(Premium_conv_rate,2))
+
+members <- new_members %>%
+  inner_join(conversion) %>%
+  ungroup() %>%
+  select(-Period) %>%
+  rownames_to_column() %>% 
+  gather(var, value, -rowname) %>%
+  mutate(value = as.character((value))) %>%
+  spread(rowname, value) %>%
+  rename(Period1 = `1`, Period2 = `2`)
+
+members %>% gt() %>%
+  tab_options(table.align = "left") %>%
+  tab_header("Konvertering til medlemsskab")
+```
+<br>
+
+### Grafer til sammenligning af perioderne
+
+Her er data grupperet efter titler således at hvert datapunkt repræsenterer en bog
+
+<br>
+```{r fig.width=12,fig.height=9}
+# each book 
+
+df_isbn <- df %>%
+  group_by(title,Period) %>%
+  summarise(transactions = n(),
+            revenue = round(sum(ProductSales)),
+            DB1 = round(sum(`4_DB1`)),
+            DB2 = round(sum(`5_DB2`)))
+
+# members
+new_members_book <- df %>%
+  filter(SubscriptionInit_Key == 1) %>%
+  group_by(title, Period) %>%
+  count() %>%
+  rename(new_members = n)
+
+# book conv rate
+conversion_book <- df %>%
+  group_by(title,Period,SubscriptionInit_Key) %>%
+  summarise(n = n()) %>%
+  pivot_wider(names_from = SubscriptionInit_Key,values_from = n) %>%
+  mutate(Premium_conv_rate = round(`1` / `0` * 100,1)) %>%
+  select(title,Period, Premium_conv_rate) %>%
+  mutate(Premium_conv_rate = replace_na(Premium_conv_rate,0))
+
+
+df_isbn <- df_isbn %>%
+  left_join(new_members_book, by = c("title","Period")) %>%
+  left_join(conversion_book, by = c("title","Period")) %>%
+  mutate(new_members = replace_na(new_members,0)) %>%
+  ungroup()
+
+# Grafer
+
+df_isbn_long <- df_isbn %>%
+  select(-title) %>%
+  pivot_longer(-Period) 
+
+df_isbn_long$name = factor(df_isbn_long$name, levels=c('transactions','revenue','DB1','DB2','new_members','Premium_conv_rate'))
+
+df_isbn_long %>%
+  ggplot(aes(Period,value,colour = Period)) +
+  geom_jitter(colour = "darkgrey") +
+  geom_boxplot(alpha=.4,outlier.shape = NA) +
+  theme_minimal() +
+  facet_wrap(~name,scales="free") +
+  ggthemes::scale_colour_tableau() +
+  theme(strip.text = element_text(size = 14),
+        axis.text = element_text(size=12),
+        strip.background = element_rect(fill="lightgrey",colour="lightgrey"),
+        panel.spacing.y = unit(1,"cm"))
+
+```
+<br>
+
+### Statistiske tests
+
+<br>
+Data består af tallene for hver bog (se tabel nedenfor), hvor vi tester hvorvidt forskellen mellem perioderne er signifikante.
+
+<br>
+
+#### Ordrer
+
+<br>
+```{r}
+library(gtsummary)
+library(broom)
+
+transactions_mod <- lm(transactions ~Period,data=df_isbn)
+
+tidy(transactions_mod) %>% mutate_if(is.numeric,round,1) %>% gt()  %>%
+  tab_options(table.align = "left")
+```
+
+<br>
+
+#### Omsætning
+
+<br>
+
+```{r}
+revenue_mod <- lm(revenue ~Period,data=df_isbn)
+
+tidy(revenue_mod) %>% mutate_if(is.numeric,round,1) %>% gt()  %>%
+  tab_options(table.align = "left")
+```
+
+<br>
+
+#### DB1
+
+<br>
+
+```{r}
+
+db1_mod <- lm(DB1 ~Period,data=df_isbn)
+
+tidy(db1_mod) %>% mutate_if(is.numeric,round,1) %>% gt()  %>%
+  tab_options(table.align = "left")
+```
+
+<br>
+
+#### DB2
+
+<br>
+
+```{r}
+
+db2_mod <- lm(DB2 ~Period,data=df_isbn)
+
+tidy(db2_mod) %>% mutate_if(is.numeric,round,1) %>% gt()  %>%
+  tab_options(table.align = "left")
+```
+
+<br>
+
+#### Antal nye medlemmer
+
+<br>
+
+```{r}
+
+member_mod <- lm(new_members ~Period,data=df_isbn)
+
+tidy(member_mod) %>% mutate_if(is.numeric,round,1) %>% gt()  %>%
+  tab_options(table.align = "left")
+```
+
+<br>
+
+#### Premium-konverteringsrate
+
+<br>
+
+```{r}
+
+conv_mod <- lm(Premium_conv_rate ~Period,data=df_isbn)
+
+tidy(conv_mod) %>% mutate_if(is.numeric,round,1) %>% gt()  %>%
+  tab_options(table.align = "left")
+```
+
+<br>
+ 
+### Tabel med data for hver bog
+
+<br>
+
+```{r}
+library(DT)
+datatable(df_isbn)
+```
+
